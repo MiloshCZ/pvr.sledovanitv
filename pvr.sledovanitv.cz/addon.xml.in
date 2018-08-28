@@ -20,7 +20,7 @@
     <disclaimer lang="sk">Tento program je rozširovaný v nádeji, že bude užitočný, avšak BEZ AKEJKOĽVEK ZÁRUKY. Autori žiadnym spôsobom nenesú zodpovednosť za zlyhanie pri nahrávaní, neplatné časovače, stratený čas, či akékoľvek iné nežiadúce dopady...</disclaimer>
     <platform>@PLATFORM@</platform>
     <assets>
-      <icon>resources/logo.svg</icon>
+      <icon>resources/logo.png</icon>
     </assets>
   </extension>
 </addon>
