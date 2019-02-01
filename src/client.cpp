@@ -331,12 +331,12 @@ PVR_ERROR GetEPGTagStreamProperties(const EPG_TAG* tag, PVR_NAMED_VALUE* propert
   if (!tag || !properties || !iPropertiesCount || !data)
     return PVR_ERROR_SERVER_ERROR;
 
-  std::string stream_url;
-  PVR_ERROR ret = data->GetEPGStreamUrl(tag, stream_url);
+  std::string stream_url, stream_type;
+  PVR_ERROR ret = data->GetEPGStreamUrl(tag, stream_url, stream_type);
   if (PVR_ERROR_NO_ERROR != ret)
     return ret;
 
-  return FillStreamProperties(data->GetStreamProperties(stream_url, false), properties, iPropertiesCount);
+  return FillStreamProperties(data->GetStreamProperties(stream_url, stream_type, false), properties, iPropertiesCount);
 }
 
 int GetChannelsAmount(void)
@@ -363,12 +363,12 @@ PVR_ERROR GetChannelStreamProperties(const PVR_CHANNEL* channel, PVR_NAMED_VALUE
   if (!channel || !properties || !iPropertiesCount || !data)
     return PVR_ERROR_SERVER_ERROR;
 
-  std::string stream_url;
-  PVR_ERROR ret = data->GetChannelStreamUrl(channel, stream_url);
+  std::string stream_url, stream_type;
+  PVR_ERROR ret = data->GetChannelStreamUrl(channel, stream_url, stream_type);
   if (PVR_ERROR_NO_ERROR != ret)
     return ret;
 
-  return FillStreamProperties(data->GetStreamProperties(stream_url, true), properties, iPropertiesCount);
+  return FillStreamProperties(data->GetStreamProperties(stream_url, stream_type, true), properties, iPropertiesCount);
 }
 
 int GetChannelGroupsAmount(void)
@@ -438,12 +438,12 @@ PVR_ERROR GetRecordingStreamProperties(const PVR_RECORDING* recording, PVR_NAMED
   if (!recording || !properties || !iPropertiesCount || !data)
     return PVR_ERROR_SERVER_ERROR;
 
-  std::string stream_url;
-  PVR_ERROR ret = data->GetRecordingStreamUrl(recording->strRecordingId, stream_url);
+  std::string stream_url, stream_type;
+  PVR_ERROR ret = data->GetRecordingStreamUrl(recording->strRecordingId, stream_url, stream_type);
   if (PVR_ERROR_NO_ERROR != ret)
     return ret;
 
-  return FillStreamProperties(data->GetStreamProperties(stream_url, false), properties, iPropertiesCount);
+  return FillStreamProperties(data->GetStreamProperties(stream_url, stream_type, false), properties, iPropertiesCount);
 }
 
 /** TIMER FUNCTIONS */
@@ -469,6 +469,27 @@ PVR_ERROR GetTimerTypes(PVR_TIMER_TYPE types[], int *size)
 {
   XBMC->Log(LOG_DEBUG, "%s - size: %d", __FUNCTION__, *size);
   int pos = 0;
+  types[pos].iId = pos + 1;
+  types[pos].iAttributes = PVR_TIMER_TYPE_IS_MANUAL | PVR_TIMER_TYPE_SUPPORTS_CHANNELS | PVR_TIMER_TYPE_SUPPORTS_START_TIME;
+  types[pos].strDescription[0] = '\0'; // let Kodi generate the description
+  types[pos].iPrioritiesSize = 0; // no priorities needed
+  //types[pos].priorities
+  //types[pos].iPrioritiesDefault = 0;
+  types[pos].iLifetimesSize = 0; // no lifetime settings supported yet
+  //types[pos].lifetimes
+  //types[pos].iLifetimesDefault = 0;
+  types[pos].iPreventDuplicateEpisodesSize = 0;
+  //types[pos].preventDuplicateEpisodes
+  //types[pos].iPreventDuplicateEpisodesDefault = 0;
+  types[pos].iRecordingGroupSize = 0;
+  //types[pos].maxRecordings
+  //types[pos].iRecordingGroupDefault = 0;
+  types[pos].iMaxRecordingsSize = 0;
+  //types[pos].maxRecordings
+  //types[pos].iMaxRecordingsDefault = 0;
+  XBMC->Log(LOG_DEBUG, "%s - attributes: 0x%x", __FUNCTION__, types[pos].iAttributes);
+
+  ++pos;
   types[pos].iId = pos + 1;
   types[pos].iAttributes = PVR_TIMER_TYPE_REQUIRES_EPG_TAG_ON_CREATE | PVR_TIMER_TYPE_SUPPORTS_CHANNELS | PVR_TIMER_TYPE_SUPPORTS_START_TIME;
   types[pos].strDescription[0] = '\0'; // let Kodi generate the description

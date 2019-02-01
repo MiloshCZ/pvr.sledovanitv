@@ -25,14 +25,27 @@
  */
 
 #include <json/json.h>
-#ifdef TARGET_WINDOWS
+#if defined(TARGET_POSIX)
+#include <unistd.h>
+#endif
+#if defined(TARGET_LINUX) || defined(TARGET_FREEBSD) || defined(TARGET_DARWIN)
+#include <net/if.h>
+#include <ifaddrs.h>
+# if defined(TARGET_LINUX)
+#include <linux/if_packet.h>
+# else //defined(TARGET_FREEBSD) || defined(TARGET_DARWIN)
+#include <net/if_types.h>
+#include <net/if_dl.h>
+# endif
+# if defined(TARGET_ANDROID)
+#include <android/api-level.h>
+# endif
+#elif defined(TARGET_WINDOWS)
 #include <winsock2.h>
 #include <iphlpapi.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "IPHLPAPI.lib")
 #pragma comment(lib, "WSOCK32.lib")
-#else
-#include <unistd.h>
 #endif
 
 #include <fstream>
@@ -40,12 +53,12 @@
 
 #include "client.h"
 #include "apimanager.h"
+#include "picosha2.h"
 #include <ctime>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
 #include <atomic>
-#include <openssl/sha.h>
 
 using namespace ADDON;
 
@@ -81,6 +94,84 @@ char *url_encode(const char *str)
   }
   *pbuf = '\0';
   return buf;
+}
+
+#if defined(TARGET_ANDROID) && __ANDROID_API__ < 24
+// Note: declare dummy "ifaddr" functions to make this compile on pre API-24 versions
+#warning "Compiling for ANDROID with API version < 24, getting MAC addres will not be available."
+static int getifaddrs(struct ifaddrs ** /*ifap*/) { errno = ENOTSUP; return -1; }
+static void freeifaddrs(struct ifaddrs * /*ifa*/) {}
+#endif
+static std::string get_mac_address()
+{
+  std::string mac_addr;
+#if defined(TARGET_ANDROID) && __ANDROID_API__ < 24
+  XBMC->Log(LOG_NOTICE, "Can't get MAC address with target Android API < 24 (no getifaddrs() support)");
+#endif
+#if defined(TARGET_LINUX) || defined(TARGET_FREEBSD) || defined(TARGET_DARWIN)
+    struct ifaddrs * addrs;
+    if (0 != getifaddrs(&addrs))
+    {
+      XBMC->Log(LOG_NOTICE, "While getting MAC address getifaddrs() failed, %s", strerror(errno));
+      return mac_addr;
+    }
+    std::unique_ptr<struct ifaddrs, decltype (&freeifaddrs)> if_addrs{addrs, &freeifaddrs};
+    for (struct ifaddrs * p = if_addrs.get(); p; p = p->ifa_next)
+    {
+#if defined(TARGET_LINUX)
+      if (nullptr != p->ifa_addr && p->ifa_addr->sa_family == AF_PACKET && 0 == (p->ifa_flags & IFF_LOOPBACK))
+      {
+        struct sockaddr_ll * address = reinterpret_cast<struct sockaddr_ll *>(p->ifa_addr);
+        std::ostringstream addr;
+        for (int i = 0; i < address->sll_halen; ++i)
+          addr << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(address->sll_addr[i]);
+        mac_addr = addr.str();
+        break;
+      }
+#else
+      if (nullptr != p->ifa_addr && p->ifa_addr->sa_family == AF_LINK)
+      {
+        struct sockaddr_dl * address = reinterpret_cast<struct sockaddr_dl *>(p->ifa_addr);
+        if (address->sdl_type == IFT_LOOP)
+          continue;
+        std::ostringstream addr;
+        for (int i = 0; i < address->sdl_alen; ++i)
+          addr << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(*(address->sdl_data + address->sdl_nlen + i));
+        mac_addr = addr.str();
+        break;
+      }
+#endif
+    }
+#elif defined(TARGET_WINDOWS)
+    std::unique_ptr<IP_ADAPTER_ADDRESSES, void (*)(void *)> pAddresses{static_cast<IP_ADAPTER_ADDRESSES *>(malloc(15 * 1024)), &free};
+    ULONG outBufLen = 0;
+
+    if (GetAdaptersAddresses(AF_UNSPEC, 0, NULL, pAddresses.get(), &outBufLen) == ERROR_BUFFER_OVERFLOW)
+    {
+        pAddresses.reset(static_cast<IP_ADAPTER_ADDRESSES *>(malloc(outBufLen)));
+    }
+
+    if (GetAdaptersAddresses(AF_UNSPEC, 0,  NULL,  pAddresses.get(), &outBufLen) == NO_ERROR)
+    {
+      IP_ADAPTER_ADDRESSES * p_addr = pAddresses.get();
+      while (p_addr)
+      {
+        if (p_addr->PhysicalAddressLength > 0)
+        {
+          std::ostringstream addr;
+          for (int i = 0; i < p_addr->PhysicalAddressLength; ++i)
+            addr << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(p_addr->PhysicalAddress[i]);
+          mac_addr = addr.str();
+          break;
+        }
+        p_addr = p_addr->Next;
+      }
+    } else
+    {
+      XBMC->Log(LOG_NOTICE, "GetAdaptersAddresses failed...");
+    }
+#endif
+    return mac_addr;
 }
 
 std::string ApiManager::formatTime(time_t t)
@@ -173,75 +264,19 @@ bool ApiManager::pairDevice()
     char hostName[256];
     gethostname(hostName, 256);
 
-    std::string macAddr;
-#ifndef TARGET_WINDOWS
-    constexpr char const * const iface_possibilities[] = {
-      "/sys/class/net/eth0/address"
-        , "/sys/class/net/wlan0/address"
-        , "/sys/class/net/eth1/address"
-        , "/sys/class/net/wlan1/address"
-    };
-    for (const auto & file : iface_possibilities)
-    {
-      std::ifstream ifs(file);
-      if (ifs.is_open())
-      {
-        std::getline(ifs, macAddr);
-      }
-      if (!macAddr.empty())
-      {
-        macAddr.erase(std::remove(macAddr.begin(), macAddr.end(), ':'), macAddr.end());
-        break;
-      }
-    }
-#else
-    std::unique_ptr<IP_ADAPTER_ADDRESSES, void (*)(void *)> pAddresses{static_cast<IP_ADAPTER_ADDRESSES *>(malloc(15 * 1024)), &free};
-    ULONG outBufLen = 0;
-
-    if (GetAdaptersAddresses(AF_UNSPEC, 0, NULL, pAddresses.get(), &outBufLen) == ERROR_BUFFER_OVERFLOW)
-    {
-        pAddresses.reset(static_cast<IP_ADAPTER_ADDRESSES *>(malloc(outBufLen)));
-    }
-
-    if (GetAdaptersAddresses(AF_UNSPEC, 0,  NULL,  pAddresses.get(), &outBufLen) == NO_ERROR)
-    {
-      IP_ADAPTER_ADDRESSES * p_addr = pAddresses.get();
-      while (p_addr)
-      {
-        if (p_addr->PhysicalAddressLength > 0)
-        {
-          std::ostringstream addr;
-          for (int i = 0; i < p_addr->PhysicalAddressLength; ++i)
-            addr << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(p_addr->PhysicalAddress[i]);
-          macAddr = addr.str();
-          break;
-        }
-        p_addr = p_addr->Next;
-      }
-    } else
-    {
-      XBMC->Log(LOG_NOTICE, "GetAdaptersAddresses failed...");
-    }
-#endif
-
+    std::string macAddr = get_mac_address();
     if (macAddr.empty())
     {
       XBMC->Log(LOG_NOTICE, "Unable to get MAC address, using a dummy for serial");
       macAddr = "11223344";
     }
 
-    // compute SHA1 of string representation of MAC address
-    unsigned char hash[SHA_DIGEST_LENGTH];
-    SHA1(reinterpret_cast<unsigned char const *>(macAddr.c_str()), macAddr.size(), hash);
-    std::ostringstream serial;
-    for (const auto c : hash)
-      serial << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(c);
-
     params["username"] = m_userName;
     params["password"] = m_userPassword;
     params["type"] = "androidportable";
     params["product"] = hostName;
-    params["serial"] = serial.str();
+    // compute SHA256 of string representation of MAC address
+    params["serial"] = picosha2::hash256_hex_string(macAddr);
     params["unit"] = "default";
     //params["checkLimit"] = "1";
 
@@ -365,7 +400,7 @@ bool ApiManager::getPvr(Json::Value & root)
   return isSuccess(apiCall("get-pvr", ApiParamMap()), root);
 }
 
-std::string ApiManager::getRecordingUrl(const std::string &recId)
+std::string ApiManager::getRecordingUrl(const std::string &recId, std::string & channel)
 {
   ApiParamMap param;
   param["recordId"] = recId;
@@ -375,6 +410,7 @@ std::string ApiManager::getRecordingUrl(const std::string &recId)
 
   if (isSuccess(apiCall("record-timeshift", param), root))
   {
+    channel = root.get("channel", "").asString();
     return root.get("url", "").asString();
   }
 
@@ -383,6 +419,7 @@ std::string ApiManager::getRecordingUrl(const std::string &recId)
 
 bool ApiManager::getTimeShiftInfo(const std::string &eventId
     , std::string & streamUrl
+    , std::string & channel
     , int & duration) const
 {
   ApiParamMap param;
@@ -394,6 +431,7 @@ bool ApiManager::getTimeShiftInfo(const std::string &eventId
   if (isSuccess(apiCall("event-timeshift", param), root))
   {
     streamUrl = root.get("url", "").asString();
+    channel = root.get("channel", "").asString();
     duration = root.get("duration", 0).asInt();
     return true;
   }

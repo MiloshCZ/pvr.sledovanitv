@@ -24,6 +24,7 @@
  *
  */
 
+#include <set>
 #include <sstream>
 #include <string>
 #include <fstream>
@@ -84,10 +85,10 @@ PVRIptvData::PVRIptvData(PVRIptvConfiguration cfg)
   CreateThread();
 }
 
-void PVRIptvData::LoadRecordingsJob()
+bool PVRIptvData::LoadRecordingsJob()
 {
   if (!KeepAlive())
-    return;
+    return false;
 
   bool load = false;
   {
@@ -102,6 +103,7 @@ void PVRIptvData::LoadRecordingsJob()
   {
     LoadRecordings();
   }
+  return load;
 }
 
 void PVRIptvData::SetLoadRecordings()
@@ -280,7 +282,7 @@ void *PVRIptvData::Process(void)
 
     work_done = false;
 
-    LoadRecordingsJob();
+    work_done |= LoadRecordingsJob();
 
     // trigger full refresh once a time
     work_done |= trigger_full_refresh.Call();
@@ -565,7 +567,10 @@ bool PVRIptvData::LoadRecordings()
   {
     for (auto & recording : *new_recordings)
     {
-      recording.strStreamUrl = m_manager.getRecordingUrl(recording.strRecordId);
+      std::string channel_id;
+      recording.strStreamUrl = m_manager.getRecordingUrl(recording.strRecordId, channel_id);
+      // get the stream type based on channel
+      recording.strStreamType = ChannelStreamType(channel_id);
     }
   }
   bool changed_t = new_timers->size() != timers->size();
@@ -639,6 +644,7 @@ bool PVRIptvData::LoadPlayList(void)
     iptvchan.strChannelName = channel.get("name", "").asString();
     iptvchan.strGroupId = channel.get("group", "").asString();
     iptvchan.strStreamURL = channel.get("url", "").asString();
+    iptvchan.strStreamType = channel.get("streamType", "").asString();
     XBMC->Log(LOG_DEBUG, "Channel %s, URL: %s", iptvchan.strChannelName.c_str(), iptvchan.strStreamURL.c_str());
     iptvchan.iUniqueId = i + 1;
     iptvchan.iChannelNumber = i + 1;
@@ -731,7 +737,7 @@ PVR_ERROR PVRIptvData::GetChannels(ADDON_HANDLE handle, bool bRadio)
   return PVR_ERROR_NO_ERROR;
 }
 
-PVR_ERROR PVRIptvData::GetChannelStreamUrl(const PVR_CHANNEL* channel, std::string & streamUrl) const
+PVR_ERROR PVRIptvData::GetChannelStreamUrl(const PVR_CHANNEL* channel, std::string & streamUrl, std::string & streamType) const
 {
   decltype (m_channels) channels;
   {
@@ -747,6 +753,7 @@ PVR_ERROR PVRIptvData::GetChannelStreamUrl(const PVR_CHANNEL* channel, std::stri
   }
 
   streamUrl = channel_i->strStreamURL;
+  streamType = channel_i->strStreamType;
   return PVR_ERROR_NO_ERROR;
 
 }
@@ -838,8 +845,11 @@ PVR_ERROR PVRIptvData::GetEPGForChannel(ADDON_HANDLE handle, const PVR_CHANNEL &
 {
   XBMC->Log(LOG_DEBUG, "%s %s, from=%s to=%s", __FUNCTION__, channel.strChannelName, ApiManager::formatTime(iStart).c_str(), ApiManager::formatTime(iEnd).c_str());
   std::lock_guard<std::mutex> critical(m_mutex);
-  m_epgMinTime = iStart;
-  m_epgMaxTime = iEnd;
+  // Note: For future scheduled timers Kodi requests EPG (this function) with
+  // iStart & iEnd as given by the timer timespan. But we don't want to narrow
+  // our EPG interval in such cases.
+  m_epgMinTime = iStart < m_epgMinTime ? iStart : m_epgMinTime;
+  m_epgMaxTime = iEnd > m_epgMaxTime ? iEnd : m_epgMaxTime;
   return PVR_ERROR_NO_ERROR;
 }
 
@@ -904,7 +914,7 @@ PVR_ERROR PVRIptvData::IsEPGTagRecordable(const EPG_TAG* tag, bool* bIsRecordabl
   return PVR_ERROR_NO_ERROR;
 }
 
-PVR_ERROR PVRIptvData::GetEPGStreamUrl(const EPG_TAG* tag, std::string & streamUrl) const
+PVR_ERROR PVRIptvData::GetEPGStreamUrl(const EPG_TAG* tag, std::string & streamUrl, std::string & streamType) const
 {
   decltype (m_channels) channels;
   decltype (m_epg) epg;
@@ -920,11 +930,14 @@ PVR_ERROR PVRIptvData::GetEPGStreamUrl(const EPG_TAG* tag, std::string & streamU
     return ret;
 
   if (RecordingExists(epg_i->second.strRecordId))
-    return GetRecordingStreamUrl(epg_i->second.strRecordId, streamUrl);
+    return GetRecordingStreamUrl(epg_i->second.strRecordId, streamUrl, streamType);
 
+  std::string channel_id;
   int duration;
-  if (!m_manager.getTimeShiftInfo(epg_i->second.strEventId, streamUrl, duration))
+  if (!m_manager.getTimeShiftInfo(epg_i->second.strEventId, streamUrl, channel_id, duration))
     return PVR_ERROR_INVALID_PARAMETERS;
+  // get the stream type based on channel
+  streamType = ChannelStreamType(channel_id);
 
   return PVR_ERROR_NO_ERROR;
 }
@@ -934,6 +947,7 @@ PVR_ERROR PVRIptvData::SetEPGTimeFrame(int iDays)
   XBMC->Log(LOG_DEBUG, "%s iDays=%d", __FUNCTION__, iDays);
   time_t now = time(nullptr);
   std::lock_guard<std::mutex> critical(m_mutex);
+  m_epgMinTime = now;
   m_epgMaxTime = now + iDays * 86400;
   m_epgMaxDays = iDays;
 
@@ -1002,7 +1016,7 @@ PVR_ERROR PVRIptvData::GetRecordings(ADDON_HANDLE handle)
   return PVR_ERROR_NO_ERROR;
 }
 
-PVR_ERROR PVRIptvData::GetRecordingStreamUrl(const std::string & recording, std::string & streamUrl) const
+PVR_ERROR PVRIptvData::GetRecordingStreamUrl(const std::string & recording, std::string & streamUrl, std::string & streamType) const
 {
   decltype (m_recordings) recordings;
   {
@@ -1014,6 +1028,7 @@ PVR_ERROR PVRIptvData::GetRecordingStreamUrl(const std::string & recording, std:
     return PVR_ERROR_INVALID_PARAMETERS;
 
   streamUrl = rec_i->strStreamUrl;
+  streamType = rec_i->strStreamType;
   return PVR_ERROR_NO_ERROR;
 }
 
@@ -1057,6 +1072,7 @@ PVR_ERROR PVRIptvData::GetTimers(ADDON_HANDLE handle)
     xbmcTimer.startTime = timer.startTime;
     xbmcTimer.endTime = timer.endTime;
     xbmcTimer.state = timer.state;
+    xbmcTimer.iTimerType = 1; // Note: this must match some type from GetTimerTypes()
     xbmcTimer.iLifetime = timer.iLifeTime;
     strAssign(xbmcTimer.strTitle, timer.strTitle);
     strAssign(xbmcTimer.strSummary, timer.strSummary);
@@ -1153,14 +1169,15 @@ bool PVRIptvData::LoggedIn() const
   return m_manager.loggedIn();
 }
 
-properties_t PVRIptvData::GetStreamProperties(const std::string & url, bool isLive) const
+properties_t PVRIptvData::GetStreamProperties(const std::string & url, const std::string & streamType, bool isLive) const
 {
+  static const std::set<std::string> ADAPTIVE_TYPES = {"mpd", "ism", "hls"};
   properties_t props;
   props[PVR_STREAM_PROPERTY_STREAMURL] = url;
-  if (m_useAdaptive)
+  if (m_useAdaptive && 0 < ADAPTIVE_TYPES.count(streamType))
   {
     props[PVR_STREAM_PROPERTY_INPUTSTREAMADDON] = "inputstream.adaptive";
-    props["inputstream.adaptive.manifest_type"] = "hls";
+    props["inputstream.adaptive.manifest_type"] = streamType;
   }
   if (isLive)
     props[PVR_STREAM_PROPERTY_ISREALTIMESTREAM] = "true";
@@ -1185,4 +1202,21 @@ std::string PVRIptvData::ChannelsList() const
         os << chan.strId;
       });
   return os.str();
+}
+
+std::string PVRIptvData::ChannelStreamType(const std::string & channelId) const
+{
+  decltype (m_channels) channels;
+  {
+    std::lock_guard<std::mutex> critical(m_mutex);
+    channels = m_channels;
+  }
+
+  std::string stream_type = "unknown";
+  auto channel_i = std::find_if(channels->cbegin(), channels->cend(), [&channelId] (const PVRIptvChannel & c) { return c.strId == channelId; });
+  if (channels->cend() == channel_i)
+    XBMC->Log(LOG_NOTICE, "%s can't find channel %s", __FUNCTION__, channelId.c_str());
+  else
+    stream_type = channel_i->strStreamType;
+  return stream_type;
 }
