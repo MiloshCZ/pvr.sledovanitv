@@ -38,6 +38,13 @@
 #include "apimanager.h"
 #include "CallLimiter.hh"
 
+#if defined(TARGET_WINDOWS)
+# define LOCALTIME_R(src, dst) localtime_s(dst, src)
+# define GMTIME_R(src, dst) gmtime_s(dst, src)
+#else
+# define LOCALTIME_R(src, dst) localtime_r(src, dst)
+# define GMTIME_R(src, dst) gmtime_r(src, dst)
+#endif
 using namespace std;
 using namespace ADDON;
 
@@ -50,6 +57,25 @@ template <int N> void strAssign(char (&dst)[N], const std::string & src)
 static void xbmcStrFree(char * str)
 {
   XBMC->FreeString(str);
+}
+
+static unsigned DiffBetweenPragueAndLocalTime(const time_t * when = nullptr)
+{
+  time_t tloc;
+  if (0 == when)
+    time(&tloc);
+  else
+    tloc = *when;
+
+  struct tm tm1;
+  LOCALTIME_R(&tloc, &tm1);
+  auto isdst = tm1.tm_isdst;
+  GMTIME_R(&tloc, &tm1);
+  tm1.tm_isdst = isdst;
+  time_t t2 = mktime(&tm1);
+
+  // Note: Prague(Czech) is in Central Europe Time -> CET or CEST == UTC+1 or UTC+2 == +3600 or +7200
+  return tloc - t2 - (isdst > 0 ? 7200 : 3600);
 }
 
 PVRIptvData::PVRIptvData(PVRIptvConfiguration cfg)
@@ -399,7 +425,8 @@ bool PVRIptvData::LoadEPG(time_t iStart, bool bSmallStep)
         iptventry.availableTimeshift = availability == "timeshift" || availability == "pvr";
         iptventry.strRecordId = epgEntry["recordId"].asString();
 
-        XBMC->Log(LOG_DEBUG, "Loading TV show: %s - %s, start=%s", strChId.c_str(), iptventry.strTitle.c_str(), epgEntry.get("startTime", "").asString().c_str());
+        XBMC->Log(LOG_DEBUG, "Loading TV show: %s - %s, start=%s(epoch=%llu)", strChId.c_str(), iptventry.strTitle.c_str()
+            , epgEntry.get("startTime", "").asString().c_str(), static_cast<long long unsigned>(start_time));
 
         // notify about the epg change...and store it
         EPG_TAG tag;
@@ -511,6 +538,7 @@ bool PVRIptvData::LoadRecordings()
       if (channel_i != channels->cend())
       {
         iptvrecording.strChannelName = channel_i->strChannelName;
+        iptvrecording.iChannelUid = channel_i->iUniqueId;
       }
       iptvrecording.startTime = startTime;
       iptvrecording.strPlotOutline = record.get("event", "").get("description", "").asString();
@@ -966,7 +994,8 @@ int PVRIptvData::ParseDateTime(std::string strDate)
   timeinfo.tm_year -= 1900;
   timeinfo.tm_isdst = -1;
 
-  return mktime(&timeinfo);
+  time_t t = mktime(&timeinfo);
+  return t - DiffBetweenPragueAndLocalTime(&t);
 }
 
 int PVRIptvData::GetRecordingsAmount()
@@ -1001,6 +1030,7 @@ PVR_ERROR PVRIptvData::GetRecordings(ADDON_HANDLE handle)
     strAssign(xbmcRecord.strPlot, rec.strPlotOutline);
     xbmcRecord.iDuration = rec.duration;
     xbmcRecord.iLifetime = rec.iLifeTime;
+    xbmcRecord.iChannelUid = rec.iChannelUid;
     xbmcRecord.channelType = rec.bRadio ? PVR_RECORDING_CHANNEL_TYPE_RADIO : PVR_RECORDING_CHANNEL_TYPE_TV;
 
     xbmc_records.push_back(std::move(xbmcRecord));
